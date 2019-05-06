@@ -1,0 +1,712 @@
+<html>
+
+<head>
+  <script type="text/javascript" src="https://pyodide.pymedphys.com/pyodide.js"></script>
+  <div id="target">Change me!</div>
+  <canvas id="canvas" />
+  <script type="text/javascript">
+    pythonCode = `
+
+from js import document
+
+e = document.getElementById("target")
+e.innerText = str("Finished")
+
+
+canvas = document.getElementById('canvas')
+
+context = canvas.getContext("2d")
+
+def draw(flat):
+
+	W = H = int(len(flat)**0.5)+1
+	S = 4
+
+	canvas.setAttribute('width', W*S)
+	canvas.setAttribute('height', H*S)
+
+	context.clearRect(0, 0, canvas.width, canvas.height);
+
+	for y in range(H):
+		for x in range(W):
+			sx = x*S
+			sy = y*S
+			i = y*W+x
+			try:
+				v = flat[i]
+			except IndexError:
+				return
+			context.fillStyle = "#"+hex(v)[2:]+"00"+hex((v+128)%256)[2:]
+			context.fillRect(sx,sy,sx+S,sy+S)
+
+
+def tc(val, bits):
+    """compute the 2's complement of int value val"""
+    if (val & (1 << (bits - 1))) != 0: # if sign bit is set e.g., 8bit: 128-255
+        val = val - (1 << bits)        # compute negative value
+    return val & ((2 ** bits) - 1)                         # return positive value as is
+
+def tcr(val, bits):
+    """compute the 2's complement of int value val"""
+    if (val & (1 << (bits - 1))) != 0: # if sign bit is set e.g., 8bit: 128-255
+        val = val - (1 << bits)        # compute negative value
+    return val                  # return positive value as is
+
+
+BYTESIZE = 8
+WORDSIZE = 8*BYTESIZE
+WMAX = 2**WORDSIZE
+WMASK = WMAX-1
+
+STATUS, REC, GAS, MEM, IP = range(5)
+HEAD, STACK, MAP, MEMORY = range(4)
+F_STATUS, F_REC, F_GAS, F_MEM, F_IP, F_LENSTACK, F_LENMAP, F_LENMEMORY, F_STACK, F_MAP, F_MEMORY = range(11)
+
+NORMAL, FROZEN, VOLHALT, VOLRETURN, VOLYIELD, OOG, OOC, OOS, OOM, OOB, UOC, RECURSE, IIN = range(13)
+#STATI = ["NORMAL", "FROZEN", "VOLHALT", "VOLRETURN", "VOLYIELD", "OUTOFGAS", "OUTOFCODE", "OUTOFSTACK", "OUTOFMEMORY", "OUTOFBOUNDS", "UNKNOWNCODE", "RUN"]
+STATI = ["NOR", "FRZ", "HLT", "RET", "YLD", "OOG", "OOC", "OOS", "OOM", "OOB", "UOC", "REC"]
+
+HALT, RETURN, YIELD, RUN, JUMP, JUMPR, JZ, JZR, PUSH, POP, DUP, FLIP, KEYSET, KEYHAS, KEYGET, KEYDEL, STACKLEN, MEMORYLEN, AREALEN, READ, WRITE, AREA, DEAREA, ALLOC, DEALLOC, ADD, SUB, NOT, MUL, DIV, MOD, SHA256, ECVERIFY, ROT, ROT2, CMP, HEADER = range(37)
+
+INSTR = ["HALT", "RETURN", "YIELD", "RUN", "JUMP", "JUMPR", "JZ", "JZR", "PUSH", "POP", "DUP", "FLIP", "KEYSET", "KEYHAS", "KEYGET", "KEYDEL", "STACKLEN", "MEMORYLEN", "AREALEN", "READ", "WRITE", "AREA", "DEAREA", "ALLOC", "DEALLOC", "ADD", "SUB", "NOT", "MUL", "DIV", "MOD", "SHA256", "ECVERIFY", "ROT", "ROT2", "CMP", "HEADER"]
+
+REQS = [
+    # Name, Instruction length, Required Stack Size, Stack effect, Gas cost
+    [1,0,0,1],
+    [1,0,0,1],
+    [1,0,0,1],
+
+    [1,1,-1,0],
+
+    [1,1,-1,1],#jumps
+    [1,1,-1,1],
+    [1,2,-2,1],
+    [1,2,-2,1],
+
+    [2,0,1,2],
+    [1,0,-1,2],#XXX changed stack effect
+
+    [1,0,1,4],
+    [1,2,0,4],
+
+    [1,2,-2,10],#keys
+    [1,1,0,4],
+    [1,1,0,6],
+    [1,1,-1,4],
+
+    [1,0,1,2],#lens
+    [1,0,1,2],
+    [1,1,0,2],
+
+    [1,2,-1,2],#r/w
+    [1,3,-3,2],
+
+    [1,0,1,10],#a/d
+    [1,1,-1,10],#!use after free!
+    [1,2,-2,10],#alloc/dealloc
+    [1,2,-2,10],
+
+    [1,2,-1,6],
+    [1,2,-1,6],
+    [1,1,0,4],
+    [1,2,-1,8],
+    [1,2,-1,10],
+    [1,2,-1,10],
+
+    [1,1,0,100],
+    [1,1,0,100],
+
+    [1,3,0,10],
+    [1,3,0,10],
+
+    [1,2,-1,10],
+
+    [1,1,0,10],
+]
+
+def s(sharp):
+    """Flattens and serializes the nested state structure"""
+    flat = [] #!!! new list
+    flat += sharp[HEAD]
+    flat += [len(sharp[STACK])]
+    flat += [len(sharp[MAP])]
+    flat += [len(sharp)-MEMORY]
+    flat += sharp[STACK]
+    for i in range(0, len(sharp[MAP]), 2):
+        k = sharp[MAP][i]
+        v = sharp[MAP][i+1]
+        flat += [k, v]
+    for i in range(MEMORY, len(sharp)):
+        flat += [len(sharp[i])]
+        flat += sharp[i]
+    return flat
+
+def d(flat):
+    """Deserializes and restores the runtime state structure from the flat version"""
+    sharp = []
+    sharp.append(flat[:F_LENSTACK])
+    lenstack = flat[F_LENSTACK]
+    lenmap = flat[F_LENMAP]
+    lenmemory = flat[F_LENMEMORY]
+    offset = F_LENMEMORY+1
+    assert offset >= 0
+    assert lenstack >= 0
+    assert lenmap >= 0
+    assert lenmemory >= 0
+    sharp.append(flat[offset:offset+lenstack])
+    offset += lenstack
+    sharp.append(flat[offset:offset+lenmap])
+    offset += lenmap
+    #print(lenstack, lenmap, lenmemory)
+    index = offset
+    #print(flat, len(flat))
+    for area in range(lenmemory):
+        #print(index, lenmemory)
+        lenarea = flat[index]
+        assert index >= 0
+        assert lenarea >= 0
+        sharp.append(flat[index+1:index+1+lenarea])
+        index = index + 1 + lenarea
+    return sharp
+
+def next(state, jump=-1, relative=False):
+    """Pops arguments. Sets the instruction pointer"""
+    instr = state[MEMORY][state[HEAD][IP]]
+    reqs = REQS[instr]
+    if reqs[2] < 0:
+        for i in range(-reqs[2]):
+            state[STACK].pop(-1)
+        #XXX state[HEAD][MEM] += abs(reqs[2])
+
+    if jump == -1:
+        state[HEAD][IP] += reqs[0]
+    else:
+        if relative:
+            #print("J=", tcr(jump, WORDSIZE))
+            jump = (state[HEAD][IP] + tcr(jump, WORDSIZE)) % WMAX
+        #print(state[HEAD][IP], jump)
+
+        state[HEAD][IP] = jump
+
+# The following functions should have no or one side effect. If one, either
+# 1. Set a STATE flag and return False, True otherwise
+# 2. Have a side effect and be called _last_
+# This is to ensure failing instructions can be continued normally
+
+def top(state):
+    """Returns the top of the stack"""
+    if len(state[STACK]) <= 0:
+        return -1
+    else:
+        return state[STACK][-1]
+
+def push(state, value):
+    """Pushes a value onto the stack"""
+    if state[HEAD][MEM] == 0:
+        state[HEAD][STATUS] = OOM
+        return False
+    else:
+        state[STACK].append(value)
+        state[HEAD][MEM] -= 1#XXX
+        return True
+
+def validarea(state, area):
+    """Checks if this memory area index exists"""
+    if area > len(state) - MEMORY:
+        state[HEAD][STATUS] = OOB
+        return False
+    else:
+        return True
+
+def validmemory(state, area, addr):
+    """Checks if the memory address and area exist"""
+    if not validarea(state, area) or addr >= len(state[MEMORY+area]):
+        state[HEAD][STATUS] = OOB
+        return False
+    else:
+        return True
+
+def hasmem(state, mem):
+    #// XXX:
+    return True
+    """Checks if state has enough mem, sets flag otherwise"""
+    if mem <= state[HEAD][MEM]:
+        return True
+    else:
+        state[HEAD][STATUS] = OOM
+        return False
+
+
+
+
+def run(binary, gas, mem, debug):
+
+    blob = d(binary)
+
+    blob[HEAD][STATUS] = NORMAL
+    blob[HEAD][GAS] = gas
+    blob[HEAD][MEM] = mem
+
+
+    states = [blob]
+    edges = [0]
+    sizes = [len(binary)]
+    while True:
+        #XXX debug = len(states) > 1
+        state = states[-1]
+
+        jump_back = -2
+
+        ip = -1
+        instr = -1
+        reqs = [0,0,0,0]
+
+        if state[HEAD][STATUS] != NORMAL and state[HEAD][REC] == 0:
+            jump_back = len(states)-2
+
+        def jb(status=None, back=1, relative=True):
+            nonlocal state, jump_back
+
+            if relative:
+                jump_back = len(states) - 1 - back
+            else:
+                jump_back = back
+
+            if status is not None:
+                state[HEAD][STATUS] = status
+
+        # Check if state has enough gas
+        if state[HEAD][GAS] <= 0:
+            #print("OOG", state[HEAD], state[HEAD][GAS])
+            jb(OOG)
+        elif state[HEAD][MEM] <= 0:
+            jb(OOM)
+        else:
+            # Check if current instruction pointer is within code bounds
+            ip = state[HEAD][IP]
+
+            if len(state) < MEMORY + 1 or ip >= len(state[MEMORY]):
+                jb(OOC)
+            else:
+
+                instr = state[MEMORY][ip]
+
+                try:
+                    reqs = REQS[instr]
+                except IndexError:
+                    # invalid instruction
+                    jb(IIN)
+                else:
+                    # Check if extended instructions are within code bounds
+                    if ip + reqs[0] - 1 >= len(state[MEMORY]):
+                        jb(OOC)
+
+                    # Check whether stack has sufficient items for current instruction
+                    elif len(state[STACK]) < reqs[1]:
+                        jb(OOS)
+
+        if jump_back == -2:
+            # Check parent chain resources recursively
+            # This should really be a vector of maximum possible costs
+            base_gas = 1#reqs[2]
+            base_mem = 1
+            for i in range(len(states)):
+                layer_cost = base_gas#(sizes[i]+base_mem)*base_gas
+                if layer_cost > states[i][HEAD][GAS]:
+                    #print("OOG", layer_cost, states[i][HEAD][GAS])
+                    states[i][HEAD][STATUS] = OOG
+                    jump_back = i-1
+                    break
+
+        if jump_back > -2:
+            if debug:
+                print("<<<", jump_back)
+                #print(states[0][HEAD])
+                pass
+            serialized = None
+            for i in range(len(states)-1, jump_back, -1):
+                serialized = s(states[i])
+                if i!=0:
+                    states[i-1][MEMORY+edges[len(edges)-i]] = serialized
+                    states[i-1][HEAD][REC] = 0
+                    states[i-1][HEAD][IP] += 0
+                    states = states[:-1]
+                    edges = edges[:-1]
+                    sizes = sizes[:-1]
+                #if i==jump_back-1:
+                #    #states[i].status = OOG
+                #if len(states) > 1:
+                #    print(states[1][HEAD])
+                if i==0:
+                    return serialized
+
+                if i==jump_back-1:
+                    break
+
+        if debug:
+            print("".join(["<-|%s¦GAS:%s¦MEM:%s|IP:%s|%s¦%s" % (STATI[states[i][HEAD][STATUS]], str(states[i][HEAD][GAS]), str(states[i][HEAD][MEM]), states[i][HEAD][IP], states[i][STACK], INSTR[states[i][MEMORY][states[i][HEAD][IP]]]) for i in range(len(states))]))
+            #if len(states[0]) > MEMORY+1:
+            #    print(states[0][MEMORY+1])
+
+        if jump_back > -2:
+            pass
+        elif instr == RUN:
+            #area = state[STACK][-3]
+            #gas = state[STACK][-2]
+            #mem = state[STACK][-1]
+            area = state[STACK][-1]
+            if validarea(state, area) and len(state[MEMORY+area]) > 4:#HEADERLEN
+                child = state[MEMORY+area]
+                #for mi, m in enumerate(state[MEMORY:]):
+                #    print(mi, m)
+                if state[HEAD][REC] == 0:
+                    #XXX child[STATUS] = NORMAL
+                    #child[GAS] = gas
+                    #child[MEM] = mem
+                    states.append(d(state[MEMORY+area]))
+
+                    edges.append(area)
+                    sizes.append(len(state[MEMORY+area]))
+                    state[MEMORY+area] = None
+                    state[HEAD][REC] = area + 1
+
+                    if debug:
+                        print(">>>", child[STATUS])
+
+
+                # XXX do i need this?
+                if state[HEAD][REC] > 0 and child[STATUS] != NORMAL:
+                    #child[STATUS] = FROZEN
+                    #XXX may not be required
+                    state[HEAD][REC] = 0
+                    next(state)
+            else:
+                #checkresources here?
+                next(state)
+        else:
+            if debug and len(states) > 1:
+                print(state[STACK])
+                print(state[MEMORY+1:])
+                #sleep(0.1)
+                #print(state[MEMORY])
+            #print("".join(["%i;%i" % (states[i][0][GAS], states[i][0][MEM]) for i in range(len(states))]))
+            stacklen = len(state[STACK])
+            if instr == HALT:
+                state[HEAD][STATUS] = VOLHALT
+                next(state, jump=0, relative=True)
+            elif instr == RETURN:
+                state[HEAD][STATUS] = VOLRETURN
+                state[HEAD][IP] = 0
+            elif instr == YIELD:
+                state[HEAD][STATUS] = VOLYIELD
+                next(state)
+            elif instr == JUMP:
+                next(state, top(state))
+            elif instr == JZ:
+                if state[STACK][-2] == 0:
+                    next(state, top(state))
+                else:
+                    next(state)
+            elif instr == JUMPR:
+                next(state, top(state), relative=True)
+            elif instr == JZR:
+                if state[STACK][-2] == 0:
+                    next(state, top(state), relative=True)
+                else:
+                    next(state)
+            elif instr == PUSH:
+                state[STACK].append(state[MEMORY][ip+1])
+                next(state)
+            elif instr == POP:
+                if len(state[STACK]) > 0:
+                    state[STACK] = state[STACK][:-1]
+                    state[HEAD][MEM] += 1
+                    next(state)
+            elif instr == DUP:
+                state[STACK].append(top(state))
+                next(state)
+            elif instr == FLIP:
+                last = state[STACK][-1]
+                state[STACK][stacklen-1] = state[STACK][-2]
+                state[STACK][stacklen-2] = last
+                next(state)
+            elif instr == KEYSET:
+
+                if hasmem(state, 2):#or only exit if memory is actually needed?
+                    kv = [state[STACK][-2], state[STACK][-1]]
+                    for i in range(0, len(state[MAP]), 2):
+                        if state[MAP][i] == kv[0]:
+                            state[MAP][i+1] = kv[1]
+                    else:
+                        state[MAP] += kv
+                        state[HEAD][MEM] -= 2
+                    next(state)
+            elif instr == KEYHAS:
+                for i in range(0, len(state[MAP]), 2):
+                    if state[MAP][i] == state[STACK][-1]:
+                        state[STACK][-1] = 1
+                else:
+                    state[STACK][-1] = 0
+                next(state)
+            elif instr == KEYGET:
+                for i in range(0, len(state[MAP]), 2):
+                    if state[MAP][i] == state[STACK][-1]:
+                        state[STACK][-1] = state[MAP][i+1]
+                        break
+                else:
+                    state[STACK].pop(-1)
+                    state[HEAD][MEM] += 1
+                next(state)
+            elif instr == KEYDEL:
+                for i in range(0, len(state[MAP]), 2):
+                    if state[MAP][i] == state[STACK][-1]:
+                        state[MAP].pop(i)
+                        state[MAP].pop(i)
+                        state[HEAD][MEM] += 2
+                next(state)
+            elif instr == STACKLEN:
+                if push(state, len(state[STACK])):
+                    next(state)
+            elif instr == MEMORYLEN:
+                if push(state, len(state) - MEMORY):
+                    next(state)
+            elif instr == AREALEN:
+                area = state[STACK][-1]
+                if validarea(state, area):
+                    state[STACK][-1] = len(state[MEMORY+area])
+                    next(state)
+            elif instr == READ:
+                area, addr = state[STACK][stacklen-2], state[STACK][stacklen-1]
+                if validmemory(state, area, addr):
+                    #XXX area*AREALEN!!!!
+                    state[STACK][-2] = state[MEMORY+area][addr]
+                    next(state)
+                else:
+                    print(area, addr)
+                    print("INVALIDA")
+
+            elif instr == WRITE:
+                area, addr = state[STACK][stacklen-3], state[STACK][stacklen-2]
+                value = state[STACK][stacklen-1]
+                if validmemory(state, area, addr):
+                    state[MEMORY+area][addr] = value
+                    next(state)
+            elif instr == AREA:
+                #sleep(1)
+                # This should cost 1 mem
+                if hasmem(state, 1):
+                    state.append([])
+                    state[HEAD][MEM] -= 1
+                    next(state)
+            elif instr == DEAREA:
+                state[HEAD][MEM] += len(state[MEMORY+top(state)])
+                state.pop(top(state))#XXX!
+                next(state)
+            elif instr == ALLOC:
+                area, size = state[STACK][stacklen-2], state[STACK][stacklen-1]
+                # Technically, -2
+
+                #print("ALLOC", len(state), area, MEMORY)
+                if len(state) > MEMORY+area:
+                    if hasmem(state, size):
+                        if validarea(state, area):
+                            state[HEAD][MEM] -= size
+                            state[MEMORY+area] += [0] * size
+                            next(state)
+                else:
+                    #error?
+                    state[HEAD][STATUS] = OOB
+                    pass
+            elif instr == DEALLOC:
+                area, size = state[STACK][stacklen-2], state[STACK][stacklen-1]
+                if validarea(state, area):
+                    if len(state[MEMORY+area]) >= size:
+                        state[HEAD][MEM] += size
+                        stop = len(state[MEMORY+area])-size
+                        if stop < 0:
+                            stop = 0
+                        state[MEMORY+area] = state[MEMORY+area][:stop]
+                        next(state)
+                    else:
+                        state[HEAD][STATUS] = OOB
+            elif instr == ADD:
+                op1, op2 = state[STACK][stacklen-2], state[STACK][stacklen-1]
+                state[STACK][stacklen-2] = (op1 + op2) % WMAX
+                next(state)
+            elif instr == SUB:
+                op1, op2 = state[STACK][stacklen-2], state[STACK][stacklen-1]
+                state[STACK][stacklen-2] = (op1 - op2) % WMAX
+                next(state)
+            elif instr == NOT:
+                state[STACK][stacklen-1] = 1 if state[STACK][-1] == 0 else 0
+                next(state)
+            elif instr == MUL:
+                op1, op2 = state[STACK][stacklen-2], state[STACK][stacklen-1]
+                state[STACK][stacklen-2] = (op1 * op2) % WMAX
+                next(state)
+            elif instr == DIV:
+                op1, op2 = state[STACK][stacklen-2], state[STACK][stacklen-1]
+                state[STACK][stacklen-2] = op1 // op2
+                next(state)
+            elif instr == MOD:
+                op1, op2 = state[STACK][stacklen-2], state[STACK][stacklen-1]
+                state[STACK][stacklen-2] = op1 % op2
+                next(state)
+            elif instr == SHA256:
+                #state[STACK][-1] = wrapint(state[STACK][-1], hashit)
+                next(state)
+            elif instr == ECVERIFY:
+                #if verify(state[STACK][-1], ):
+                pass
+            elif instr == ROT:
+                first = state[STACK][stacklen-1]
+                second = state[STACK][stacklen-2]
+                third = state[STACK][stacklen-3]
+                state[STACK][stacklen-1] = second
+                state[STACK][stacklen-2] = third
+                state[STACK][stacklen-3] = first
+                next(state)
+            elif instr == ROT2:
+                first = state[STACK][stacklen-1]
+                second = state[STACK][stacklen-2]
+                third = state[STACK][stacklen-3]
+                state[STACK][stacklen-1] = third
+                state[STACK][stacklen-2] = first
+                state[STACK][stacklen-3] = second
+                next(state)
+            elif instr == CMP:
+                first = state[STACK][stacklen-1]
+                second = state[STACK][stacklen-2]
+                if first < second:
+                    state[STACK][stacklen-2] = 0
+                else:
+                    state[STACK][stacklen-2] = 1
+                next(state)
+            elif instr == HEADER:
+                first = state[STACK][stacklen-1]
+                if first < len(state[HEAD]):
+                    state[STACK][stacklen-1] = state[HEAD][first]
+                next(state)
+            else:
+                state[HEAD][STATUS] = UOC
+
+        #if state[HEAD][GAS] % 1000000 == 0:
+        #    print(state[HEAD][GAS])
+        #Finalize
+        memdelta = 4 - sizes[-1]
+        for i in range(len(state)):
+            memdelta += 1#XXX#sizes[i]#len(state[i])
+        #print(memdelta)
+        for i in range(len(states)):
+            sizes[i] += memdelta
+            states[i][HEAD][GAS] -= 1
+            #states[i][HEAD][MEM] -= sizes[i] * 1
+
+
+
+import os
+
+def b64(b):
+    v = 0
+    for i in range(8):
+        #v |= ord(b[8-1-i])<<(i*8)
+        v |= b[8-1-i]<<(i*8)
+
+    return v
+
+def unpack(b):
+    l = b64(b)
+    d = []
+    offset = 8
+    for i in range(l):
+        v = b64(b[offset:offset+8])
+        assert v >= 0
+        d.append(v)
+        offset += 8
+    return d
+
+
+def pack(d):
+    b = b""
+    b += len(d).to_bytes(8, byteorder="big", signed=False)
+    for i in range(len(d)):
+        assert d[i] >= 0
+        v = d[i].to_bytes(8, byteorder="big", signed=False)
+        b += v
+    return b
+
+import sys
+import time
+
+def entry_point(filepath, gas, mem, debug, outpath):
+
+    if isinstance(filepath, str):
+        binary = os.open(filepath, os.O_RDONLY)
+        data = os.read(binary, 2**32)#XXX
+        os.close(binary)
+        flat = unpack(data)
+    else:
+        flat = filepath
+
+    gas = int(gas)
+    mem = int(mem)
+
+    t = time.time()
+    while True:
+        flat = run(flat, gas, mem, debug=debug)
+        #time.sleep(0.1)
+        sharp = d(flat)
+        #print(trace)
+        if sharp[HEAD][STATUS] == VOLHALT:
+            break
+        elif sharp[HEAD][STATUS] == VOLYIELD:
+            #print(len(sharp))
+            sharp[HEAD][STATUS] = NORMAL
+            if len(sharp)-MEMORY>0:
+                #print(sharp[MEMORY:])
+                if sharp[MEMORY+3][0] == 42:
+                    #print(sharp[STACK][-1])
+                    sys.stdout.write(chr(sharp[MEMORY+3][1]))
+                    sys.stdout.flush()
+                    sharp[MEMORY+3] = []
+                #sharp = sharp[:-1]
+
+            #XXX sharp[STACK] = sharp[STACK][:-2]
+        else:
+            #print(sharp[HEAD])
+            break
+        flat = s(sharp)
+
+    return flat
+
+from js import BIN
+import json
+flat = [int(i) for i in json.loads(BIN)]
+debug = False
+for i in range(1):
+    flat = entry_point(flat, 100, 1000000, debug, None)
+
+draw(flat)
+json.dumps(flat)
+`
+	STARTBIN = `[0, 0, 10000000, 100000000, 0, 0, 28, 1, 102, 13, 1835100526, 135, 1886745699, 1419, 123636697429097, 1519, 8102654602713328750, 1707, 482955849332, 1877, 31650994541849710, 2053, 8607057786497167215, 2247, 6451064, 2430, 8102654602712805989, 3641, 6386279, 3950, 7497075, 4138, 7501166, 4588, 28259044220366713, 6962, 7056, 21, 21, 21, 8, 0, 8, 1, 10, 23, 8, 135, 4, 121, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 2, 26, 20, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 8, 1, 25, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 8, 0, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 1283, 8, 1, 8, 5, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 5, 26, 20, 8, 2, 8, 9, 23, 8, 2, 10, 18, 8, 9, 26, 8, 66, 20, 8, 2, 10, 18, 8, 8, 26, 8, 111, 20, 8, 2, 10, 18, 8, 7, 26, 8, 120, 20, 8, 2, 10, 18, 8, 6, 26, 8, 105, 20, 8, 2, 10, 18, 8, 5, 26, 8, 110, 20, 8, 2, 10, 18, 8, 4, 26, 8, 103, 20, 8, 2, 10, 18, 8, 3, 26, 8, 46, 20, 8, 2, 10, 18, 8, 2, 26, 8, 46, 20, 8, 2, 10, 18, 8, 1, 26, 8, 46, 20, 8, 2, 18, 8, 9, 26, 8, 9, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 31650994541849710, 14, 4, 8, 1, 8, 2, 24, 8, 102, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 6451064, 14, 4, 8, 1, 10, 24, 8, 1, 10, 8, 0, 19, 34, 20, 8, 2, 8, 23, 23, 8, 2, 10, 18, 8, 23, 26, 8, 10, 20, 8, 2, 10, 18, 8, 22, 26, 8, 83, 20, 8, 2, 10, 18, 8, 21, 26, 8, 117, 20, 8, 2, 10, 18, 8, 20, 26, 8, 112, 20, 8, 2, 10, 18, 8, 19, 26, 8, 112, 20, 8, 2, 10, 18, 8, 18, 26, 8, 108, 20, 8, 2, 10, 18, 8, 17, 26, 8, 121, 20, 8, 2, 10, 18, 8, 16, 26, 8, 105, 20, 8, 2, 10, 18, 8, 15, 26, 8, 110, 20, 8, 2, 10, 18, 8, 14, 26, 8, 103, 20, 8, 2, 10, 18, 8, 13, 26, 8, 32, 20, 8, 2, 10, 18, 8, 12, 26, 8, 97, 20, 8, 2, 10, 18, 8, 11, 26, 8, 114, 20, 8, 2, 10, 18, 8, 10, 26, 8, 103, 20, 8, 2, 10, 18, 8, 9, 26, 8, 117, 20, 8, 2, 10, 18, 8, 8, 26, 8, 109, 20, 8, 2, 10, 18, 8, 7, 26, 8, 101, 20, 8, 2, 10, 18, 8, 6, 26, 8, 110, 20, 8, 2, 10, 18, 8, 5, 26, 8, 116, 20, 8, 2, 10, 18, 8, 4, 26, 8, 115, 20, 8, 2, 10, 18, 8, 3, 26, 8, 46, 20, 8, 2, 10, 18, 8, 2, 26, 8, 46, 20, 8, 2, 10, 18, 8, 1, 26, 8, 46, 20, 8, 2, 18, 8, 23, 26, 8, 23, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 31650994541849710, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 19, 8, 42, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 6386279, 14, 4, 8, 1, 8, 2, 24, 8, 2, 8, 11, 23, 8, 2, 10, 18, 8, 11, 26, 8, 10, 20, 8, 2, 10, 18, 8, 10, 26, 8, 82, 20, 8, 2, 10, 18, 8, 9, 26, 8, 117, 20, 8, 2, 10, 18, 8, 8, 26, 8, 110, 20, 8, 2, 10, 18, 8, 7, 26, 8, 110, 20, 8, 2, 10, 18, 8, 6, 26, 8, 105, 20, 8, 2, 10, 18, 8, 5, 26, 8, 110, 20, 8, 2, 10, 18, 8, 4, 26, 8, 103, 20, 8, 2, 10, 18, 8, 3, 26, 8, 46, 20, 8, 2, 10, 18, 8, 2, 26, 8, 46, 20, 8, 2, 10, 18, 8, 1, 26, 8, 46, 20, 8, 2, 18, 8, 11, 26, 8, 11, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 31650994541849710, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 19, 8, 100000, 10, 8, 1, 8, 3, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 1, 10, 18, 8, 3, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 7501166, 14, 4, 8, 1, 8, 3, 24, 8, 1, 10, 8, 0, 19, 8, 1, 25, 34, 20, 8, 2, 8, 21, 23, 8, 2, 10, 18, 8, 21, 26, 8, 10, 20, 8, 2, 10, 18, 8, 20, 26, 8, 82, 20, 8, 2, 10, 18, 8, 19, 26, 8, 101, 20, 8, 2, 10, 18, 8, 18, 26, 8, 116, 20, 8, 2, 10, 18, 8, 17, 26, 8, 114, 20, 8, 2, 10, 18, 8, 16, 26, 8, 105, 20, 8, 2, 10, 18, 8, 15, 26, 8, 101, 20, 8, 2, 10, 18, 8, 14, 26, 8, 118, 20, 8, 2, 10, 18, 8, 13, 26, 8, 105, 20, 8, 2, 10, 18, 8, 12, 26, 8, 110, 20, 8, 2, 10, 18, 8, 11, 26, 8, 103, 20, 8, 2, 10, 18, 8, 10, 26, 8, 32, 20, 8, 2, 10, 18, 8, 9, 26, 8, 114, 20, 8, 2, 10, 18, 8, 8, 26, 8, 101, 20, 8, 2, 10, 18, 8, 7, 26, 8, 115, 20, 8, 2, 10, 18, 8, 6, 26, 8, 117, 20, 8, 2, 10, 18, 8, 5, 26, 8, 108, 20, 8, 2, 10, 18, 8, 4, 26, 8, 116, 20, 8, 2, 10, 18, 8, 3, 26, 8, 46, 20, 8, 2, 10, 18, 8, 2, 26, 8, 46, 20, 8, 2, 10, 18, 8, 1, 26, 8, 46, 20, 8, 2, 18, 8, 21, 26, 8, 21, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 31650994541849710, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 7497075, 14, 4, 8, 1, 10, 24, 8, 1, 10, 8, 0, 19, 8, 2, 25, 34, 20, 8, 2, 8, 8, 23, 8, 2, 10, 18, 8, 8, 26, 8, 10, 20, 8, 2, 10, 18, 8, 7, 26, 8, 82, 20, 8, 2, 10, 18, 8, 6, 26, 8, 101, 20, 8, 2, 10, 18, 8, 5, 26, 8, 115, 20, 8, 2, 10, 18, 8, 4, 26, 8, 117, 20, 8, 2, 10, 18, 8, 3, 26, 8, 108, 20, 8, 2, 10, 18, 8, 2, 26, 8, 116, 20, 8, 2, 10, 18, 8, 1, 26, 8, 58, 20, 8, 2, 18, 8, 8, 26, 8, 8, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 482955849332, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 8, 2, 25, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 8102654602713328750, 14, 4, 8, 1, 10, 24, 8, 0, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 0, 99, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 2, 26, 20, 8, 3, 8, 2, 23, 8, 3, 8, 0, 8, 42, 20, 8, 3, 8, 1, 10, 10, 8, 0, 19, 8, 1, 26, 19, 20, 2, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 187, 8, 1, 8, 3, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 3, 26, 20, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 8, 9, 35, 27, 8, 56, 7, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 8, 10, 29, 8, 1, 10, 8, 0, 19, 34, 20, 8, 1, 10, 8, 0, 19, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 123636697429097, 14, 4, 8, 1, 10, 24, 8, 48, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 8, 10, 30, 25, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 1886745699, 14, 4, 8, 1, 10, 24, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 169, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 2, 26, 20, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 123636697429097, 14, 4, 8, 1, 10, 24, 8, 2, 8, 1, 23, 8, 2, 10, 18, 8, 1, 26, 8, 10, 20, 8, 2, 18, 8, 1, 26, 8, 1, 10, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 482955849332, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 175, 8, 1, 8, 3, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 3, 26, 20, 8, 0, 8, 1, 10, 8, 0, 19, 34, 20, 8, 1, 10, 8, 0, 19, 19, 8, 1, 10, 8, 0, 19, 8, 2, 26, 8, 1, 25, 19, 26, 8, 70, 7, 8, 2, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 8, 1, 10, 8, 0, 19, 19, 25, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 1886745699, 14, 4, 8, 1, 10, 24, 8, 1, 10, 8, 0, 19, 19, 8, 1, 25, 8, 1, 10, 8, 0, 19, 34, 20, 8, 18446744073709551524, 5, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 193, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 2, 26, 20, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 8, 1, 10, 8, 0, 19, 8, 2, 26, 8, 1, 25, 19, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 482955849332, 14, 4, 8, 1, 8, 2, 24, 8, 2, 8, 1, 23, 8, 2, 10, 18, 8, 1, 26, 8, 10, 20, 8, 2, 18, 8, 1, 26, 8, 1, 10, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 482955849332, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 182, 8, 1, 8, 3, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 3, 26, 20, 8, 0, 8, 1, 10, 8, 0, 19, 34, 20, 8, 1, 10, 8, 0, 19, 19, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 26, 8, 80, 7, 8, 1, 10, 8, 0, 19, 8, 3, 26, 19, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 8, 1, 10, 8, 0, 19, 19, 25, 8, 1, 10, 8, 0, 19, 8, 5, 26, 19, 8, 1, 10, 8, 0, 19, 8, 4, 26, 19, 8, 1, 10, 8, 0, 19, 19, 25, 19, 20, 8, 1, 10, 8, 0, 19, 19, 8, 1, 25, 8, 1, 10, 8, 0, 19, 34, 20, 8, 18446744073709551517, 5, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 1210, 8, 1, 8, 10, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 10, 26, 20, 8, 0, 8, 1, 10, 8, 0, 19, 34, 20, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 14, 8, 1, 10, 8, 0, 19, 8, 1, 25, 34, 20, 8, 1, 10, 8, 0, 19, 19, 8, 1, 10, 8, 0, 19, 8, 1, 25, 19, 8, 1, 26, 19, 8, 1, 10, 8, 0, 19, 8, 2, 25, 34, 20, 8, 2, 8, 25, 23, 8, 2, 10, 18, 8, 25, 26, 8, 45, 20, 8, 2, 10, 18, 8, 24, 26, 8, 70, 20, 8, 2, 10, 18, 8, 23, 26, 8, 117, 20, 8, 2, 10, 18, 8, 22, 26, 8, 110, 20, 8, 2, 10, 18, 8, 21, 26, 8, 99, 20, 8, 2, 10, 18, 8, 20, 26, 8, 116, 20, 8, 2, 10, 18, 8, 19, 26, 8, 105, 20, 8, 2, 10, 18, 8, 18, 26, 8, 111, 20, 8, 2, 10, 18, 8, 17, 26, 8, 110, 20, 8, 2, 10, 18, 8, 16, 26, 8, 32, 20, 8, 2, 10, 18, 8, 15, 26, 8, 115, 20, 8, 2, 10, 18, 8, 14, 26, 8, 105, 20, 8, 2, 10, 18, 8, 13, 26, 8, 122, 20, 8, 2, 10, 18, 8, 12, 26, 8, 101, 20, 8, 2, 10, 18, 8, 11, 26, 8, 32, 20, 8, 2, 10, 18, 8, 10, 26, 8, 105, 20, 8, 2, 10, 18, 8, 9, 26, 8, 110, 20, 8, 2, 10, 18, 8, 8, 26, 8, 32, 20, 8, 2, 10, 18, 8, 7, 26, 8, 119, 20, 8, 2, 10, 18, 8, 6, 26, 8, 111, 20, 8, 2, 10, 18, 8, 5, 26, 8, 114, 20, 8, 2, 10, 18, 8, 4, 26, 8, 100, 20, 8, 2, 10, 18, 8, 3, 26, 8, 115, 20, 8, 2, 10, 18, 8, 2, 26, 8, 58, 20, 8, 2, 10, 18, 8, 1, 26, 8, 32, 20, 8, 2, 18, 8, 25, 26, 8, 25, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 482955849332, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 8, 2, 25, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 8102654602713328750, 14, 4, 8, 1, 10, 24, 21, 17, 8, 1, 26, 8, 1, 10, 8, 0, 19, 8, 3, 25, 34, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 5, 23, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 3, 23, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 3, 26, 8, 1, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 2, 26, 8, 2, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 1, 26, 8, 4, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 23, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 1, 26, 8, 4, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 1, 10, 8, 0, 19, 8, 4, 25, 34, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 2, 23, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 4, 25, 19, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 23, 8, 5, 8, 1, 10, 8, 0, 19, 8, 5, 25, 34, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 1, 26, 8, 1, 10, 8, 0, 19, 8, 5, 25, 19, 8, 1, 25, 8, 1, 10, 8, 0, 19, 8, 2, 25, 19, 25, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 5, 25, 19, 23, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 5, 26, 8, 8, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 4, 26, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 3, 26, 8, 14, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 2, 26, 8, 4, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 1, 26, 8, 1, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 18, 8, 1, 10, 8, 0, 19, 8, 6, 25, 34, 20, 8, 1, 10, 8, 0, 19, 8, 5, 25, 19, 8, 1, 25, 8, 1, 10, 8, 0, 19, 8, 7, 25, 34, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 4, 25, 19, 8, 1, 25, 8, 1, 10, 8, 0, 19, 8, 7, 25, 19, 20, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 2, 25, 19, 8, 1, 25, 23, 8, 1, 10, 8, 0, 19, 19, 8, 1, 10, 8, 0, 19, 8, 1, 25, 19, 8, 1, 26, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 8, 0, 19, 8, 6, 25, 19, 8, 1, 10, 8, 0, 19, 8, 2, 25, 19, 8, 1, 25, 8, 1, 8, 5, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 1, 10, 18, 8, 3, 26, 34, 20, 8, 1, 10, 18, 8, 4, 26, 34, 20, 8, 1, 10, 18, 8, 5, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 8607057786497167215, 14, 4, 8, 1, 8, 5, 24, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 8, 0, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 308, 8, 1, 8, 4, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 4, 26, 20, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 18, 8, 1, 10, 8, 0, 19, 34, 20, 8, 0, 8, 1, 10, 8, 0, 19, 8, 1, 25, 34, 20, 8, 1, 10, 8, 0, 19, 8, 1, 25, 19, 8, 1, 10, 8, 0, 19, 19, 26, 8, 136, 7, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 8, 1, 10, 8, 0, 19, 8, 1, 25, 19, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 123636697429097, 14, 4, 8, 1, 10, 24, 8, 2, 8, 1, 23, 8, 2, 10, 18, 8, 1, 26, 8, 32, 20, 8, 2, 18, 8, 1, 26, 8, 1, 10, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 482955849332, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 8, 1, 25, 19, 8, 1, 25, 8, 1, 10, 8, 0, 19, 8, 1, 25, 34, 20, 8, 18446744073709551461, 5, 8, 2, 8, 0, 23, 8, 2, 18, 8, 0, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 31650994541849710, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 187, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 2, 26, 20, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 8, 3, 23, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 18, 8, 3, 26, 8, 2, 20, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 18, 8, 2, 26, 8, 0, 20, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 18, 8, 1, 26, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 20, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 449, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 2, 26, 20, 8, 2, 8, 24, 23, 8, 2, 10, 18, 8, 24, 26, 8, 45, 20, 8, 2, 10, 18, 8, 23, 26, 8, 108, 20, 8, 2, 10, 18, 8, 22, 26, 8, 97, 20, 8, 2, 10, 18, 8, 21, 26, 8, 121, 20, 8, 2, 10, 18, 8, 20, 26, 8, 111, 20, 8, 2, 10, 18, 8, 19, 26, 8, 117, 20, 8, 2, 10, 18, 8, 18, 26, 8, 116, 20, 8, 2, 10, 18, 8, 17, 26, 8, 32, 20, 8, 2, 10, 18, 8, 16, 26, 8, 97, 20, 8, 2, 10, 18, 8, 15, 26, 8, 102, 20, 8, 2, 10, 18, 8, 14, 26, 8, 116, 20, 8, 2, 10, 18, 8, 13, 26, 8, 101, 20, 8, 2, 10, 18, 8, 12, 26, 8, 114, 20, 8, 2, 10, 18, 8, 11, 26, 8, 32, 20, 8, 2, 10, 18, 8, 10, 26, 8, 101, 20, 8, 2, 10, 18, 8, 9, 26, 8, 120, 20, 8, 2, 10, 18, 8, 8, 26, 8, 101, 20, 8, 2, 10, 18, 8, 7, 26, 8, 99, 20, 8, 2, 10, 18, 8, 6, 26, 8, 117, 20, 8, 2, 10, 18, 8, 5, 26, 8, 116, 20, 8, 2, 10, 18, 8, 4, 26, 8, 105, 20, 8, 2, 10, 18, 8, 3, 26, 8, 111, 20, 8, 2, 10, 18, 8, 2, 26, 8, 110, 20, 8, 2, 10, 18, 8, 1, 26, 8, 58, 20, 8, 2, 18, 8, 24, 26, 8, 24, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 482955849332, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 8102654602712805989, 14, 4, 8, 1, 10, 24, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 8, 8, 19, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 8, 0, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 2373, 8, 1, 8, 8, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 8, 26, 20, 8, 2, 8, 7, 23, 8, 2, 10, 18, 8, 7, 26, 8, 45, 20, 8, 2, 10, 18, 8, 6, 26, 8, 97, 20, 8, 2, 10, 18, 8, 5, 26, 8, 114, 20, 8, 2, 10, 18, 8, 4, 26, 8, 101, 20, 8, 2, 10, 18, 8, 3, 26, 8, 97, 20, 8, 2, 10, 18, 8, 2, 26, 8, 58, 20, 8, 2, 10, 18, 8, 1, 26, 8, 32, 20, 8, 2, 18, 8, 7, 26, 8, 7, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 482955849332, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 8, 3, 26, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 8102654602713328750, 14, 4, 8, 1, 10, 24, 8, 2, 8, 6, 23, 8, 2, 10, 18, 8, 6, 26, 8, 45, 20, 8, 2, 10, 18, 8, 5, 26, 8, 103, 20, 8, 2, 10, 18, 8, 4, 26, 8, 97, 20, 8, 2, 10, 18, 8, 3, 26, 8, 115, 20, 8, 2, 10, 18, 8, 2, 26, 8, 58, 20, 8, 2, 10, 18, 8, 1, 26, 8, 32, 20, 8, 2, 18, 8, 6, 26, 8, 6, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 482955849332, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 8102654602713328750, 14, 4, 8, 1, 10, 24, 8, 2, 8, 6, 23, 8, 2, 10, 18, 8, 6, 26, 8, 45, 20, 8, 2, 10, 18, 8, 5, 26, 8, 109, 20, 8, 2, 10, 18, 8, 4, 26, 8, 101, 20, 8, 2, 10, 18, 8, 3, 26, 8, 109, 20, 8, 2, 10, 18, 8, 2, 26, 8, 58, 20, 8, 2, 10, 18, 8, 1, 26, 8, 32, 20, 8, 2, 18, 8, 6, 26, 8, 6, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 482955849332, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 8102654602713328750, 14, 4, 8, 1, 10, 24, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 8, 1, 10, 8, 0, 19, 34, 20, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 8, 1, 10, 8, 0, 19, 8, 1, 25, 34, 20, 8, 2, 8, 25, 23, 8, 2, 10, 18, 8, 25, 26, 8, 45, 20, 8, 2, 10, 18, 8, 24, 26, 8, 108, 20, 8, 2, 10, 18, 8, 23, 26, 8, 97, 20, 8, 2, 10, 18, 8, 22, 26, 8, 121, 20, 8, 2, 10, 18, 8, 21, 26, 8, 111, 20, 8, 2, 10, 18, 8, 20, 26, 8, 117, 20, 8, 2, 10, 18, 8, 19, 26, 8, 116, 20, 8, 2, 10, 18, 8, 18, 26, 8, 32, 20, 8, 2, 10, 18, 8, 17, 26, 8, 98, 20, 8, 2, 10, 18, 8, 16, 26, 8, 101, 20, 8, 2, 10, 18, 8, 15, 26, 8, 102, 20, 8, 2, 10, 18, 8, 14, 26, 8, 111, 20, 8, 2, 10, 18, 8, 13, 26, 8, 114, 20, 8, 2, 10, 18, 8, 12, 26, 8, 101, 20, 8, 2, 10, 18, 8, 11, 26, 8, 32, 20, 8, 2, 10, 18, 8, 10, 26, 8, 101, 20, 8, 2, 10, 18, 8, 9, 26, 8, 120, 20, 8, 2, 10, 18, 8, 8, 26, 8, 101, 20, 8, 2, 10, 18, 8, 7, 26, 8, 99, 20, 8, 2, 10, 18, 8, 6, 26, 8, 117, 20, 8, 2, 10, 18, 8, 5, 26, 8, 116, 20, 8, 2, 10, 18, 8, 4, 26, 8, 105, 20, 8, 2, 10, 18, 8, 3, 26, 8, 111, 20, 8, 2, 10, 18, 8, 2, 26, 8, 110, 20, 8, 2, 10, 18, 8, 1, 26, 8, 58, 20, 8, 2, 18, 8, 25, 26, 8, 25, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 31650994541849710, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 8, 3, 26, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 8102654602712805989, 14, 4, 8, 1, 10, 24, 8, 2, 8, 19, 23, 8, 2, 10, 18, 8, 19, 26, 8, 45, 20, 8, 2, 10, 18, 8, 18, 26, 8, 114, 20, 8, 2, 10, 18, 8, 17, 26, 8, 117, 20, 8, 2, 10, 18, 8, 16, 26, 8, 110, 20, 8, 2, 10, 18, 8, 15, 26, 8, 110, 20, 8, 2, 10, 18, 8, 14, 26, 8, 105, 20, 8, 2, 10, 18, 8, 13, 26, 8, 110, 20, 8, 2, 10, 18, 8, 12, 26, 8, 103, 20, 8, 2, 10, 18, 8, 11, 26, 8, 32, 20, 8, 2, 10, 18, 8, 10, 26, 8, 115, 20, 8, 2, 10, 18, 8, 9, 26, 8, 97, 20, 8, 2, 10, 18, 8, 8, 26, 8, 110, 20, 8, 2, 10, 18, 8, 7, 26, 8, 100, 20, 8, 2, 10, 18, 8, 6, 26, 8, 98, 20, 8, 2, 10, 18, 8, 5, 26, 8, 111, 20, 8, 2, 10, 18, 8, 4, 26, 8, 120, 20, 8, 2, 10, 18, 8, 3, 26, 8, 46, 20, 8, 2, 10, 18, 8, 2, 26, 8, 46, 20, 8, 2, 10, 18, 8, 1, 26, 8, 46, 20, 8, 2, 18, 8, 19, 26, 8, 19, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 31650994541849710, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 8, 3, 26, 19, 8, 2, 8, 1, 10, 8, 0, 19, 8, 2, 26, 19, 20, 8, 1, 10, 8, 0, 19, 8, 3, 26, 19, 8, 3, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 20, 8, 1, 10, 8, 0, 19, 8, 3, 26, 19, 3, 8, 1, 10, 8, 0, 19, 8, 3, 26, 19, 8, 0, 19, 8, 1, 10, 8, 0, 19, 8, 2, 25, 34, 20, 8, 2, 8, 38, 23, 8, 2, 10, 18, 8, 38, 26, 8, 45, 20, 8, 2, 10, 18, 8, 37, 26, 8, 115, 20, 8, 2, 10, 18, 8, 36, 26, 8, 97, 20, 8, 2, 10, 18, 8, 35, 26, 8, 110, 20, 8, 2, 10, 18, 8, 34, 26, 8, 100, 20, 8, 2, 10, 18, 8, 33, 26, 8, 98, 20, 8, 2, 10, 18, 8, 32, 26, 8, 111, 20, 8, 2, 10, 18, 8, 31, 26, 8, 120, 20, 8, 2, 10, 18, 8, 30, 26, 8, 101, 20, 8, 2, 10, 18, 8, 29, 26, 8, 100, 20, 8, 2, 10, 18, 8, 28, 26, 8, 32, 20, 8, 2, 10, 18, 8, 27, 26, 8, 112, 20, 8, 2, 10, 18, 8, 26, 26, 8, 114, 20, 8, 2, 10, 18, 8, 25, 26, 8, 111, 20, 8, 2, 10, 18, 8, 24, 26, 8, 99, 20, 8, 2, 10, 18, 8, 23, 26, 8, 101, 20, 8, 2, 10, 18, 8, 22, 26, 8, 115, 20, 8, 2, 10, 18, 8, 21, 26, 8, 115, 20, 8, 2, 10, 18, 8, 20, 26, 8, 32, 20, 8, 2, 10, 18, 8, 19, 26, 8, 104, 20, 8, 2, 10, 18, 8, 18, 26, 8, 97, 20, 8, 2, 10, 18, 8, 17, 26, 8, 108, 20, 8, 2, 10, 18, 8, 16, 26, 8, 116, 20, 8, 2, 10, 18, 8, 15, 26, 8, 101, 20, 8, 2, 10, 18, 8, 14, 26, 8, 100, 20, 8, 2, 10, 18, 8, 13, 26, 8, 32, 20, 8, 2, 10, 18, 8, 12, 26, 8, 119, 20, 8, 2, 10, 18, 8, 11, 26, 8, 105, 20, 8, 2, 10, 18, 8, 10, 26, 8, 116, 20, 8, 2, 10, 18, 8, 9, 26, 8, 104, 20, 8, 2, 10, 18, 8, 8, 26, 8, 32, 20, 8, 2, 10, 18, 8, 7, 26, 8, 115, 20, 8, 2, 10, 18, 8, 6, 26, 8, 116, 20, 8, 2, 10, 18, 8, 5, 26, 8, 97, 20, 8, 2, 10, 18, 8, 4, 26, 8, 116, 20, 8, 2, 10, 18, 8, 3, 26, 8, 101, 20, 8, 2, 10, 18, 8, 2, 26, 8, 58, 20, 8, 2, 10, 18, 8, 1, 26, 8, 32, 20, 8, 2, 18, 8, 38, 26, 8, 38, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 482955849332, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 8, 2, 25, 19, 8, 1, 10, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 8102654602713328750, 14, 4, 8, 1, 10, 24, 8, 1, 10, 8, 0, 19, 8, 2, 25, 19, 8, 3, 26, 27, 8, 347, 7, 8, 2, 8, 26, 23, 8, 2, 10, 18, 8, 26, 26, 8, 45, 20, 8, 2, 10, 18, 8, 25, 26, 8, 105, 20, 8, 2, 10, 18, 8, 24, 26, 8, 116, 20, 8, 2, 10, 18, 8, 23, 26, 8, 32, 20, 8, 2, 10, 18, 8, 22, 26, 8, 104, 20, 8, 2, 10, 18, 8, 21, 26, 8, 97, 20, 8, 2, 10, 18, 8, 20, 26, 8, 115, 20, 8, 2, 10, 18, 8, 19, 26, 8, 32, 20, 8, 2, 10, 18, 8, 18, 26, 8, 114, 20, 8, 2, 10, 18, 8, 17, 26, 8, 101, 20, 8, 2, 10, 18, 8, 16, 26, 8, 116, 20, 8, 2, 10, 18, 8, 15, 26, 8, 117, 20, 8, 2, 10, 18, 8, 14, 26, 8, 114, 20, 8, 2, 10, 18, 8, 13, 26, 8, 110, 20, 8, 2, 10, 18, 8, 12, 26, 8, 101, 20, 8, 2, 10, 18, 8, 11, 26, 8, 100, 20, 8, 2, 10, 18, 8, 10, 26, 8, 32, 20, 8, 2, 10, 18, 8, 9, 26, 8, 110, 20, 8, 2, 10, 18, 8, 8, 26, 8, 111, 20, 8, 2, 10, 18, 8, 7, 26, 8, 114, 20, 8, 2, 10, 18, 8, 6, 26, 8, 109, 20, 8, 2, 10, 18, 8, 5, 26, 8, 97, 20, 8, 2, 10, 18, 8, 4, 26, 8, 108, 20, 8, 2, 10, 18, 8, 3, 26, 8, 108, 20, 8, 2, 10, 18, 8, 2, 26, 8, 121, 20, 8, 2, 10, 18, 8, 1, 26, 8, 33, 20, 8, 2, 18, 8, 26, 26, 8, 26, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 31650994541849710, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 8, 1, 10, 8, 0, 19, 8, 2, 25, 19, 8, 4, 26, 27, 8, 299, 7, 8, 2, 8, 15, 23, 8, 2, 10, 18, 8, 15, 26, 8, 73, 20, 8, 2, 10, 18, 8, 14, 26, 8, 116, 20, 8, 2, 10, 18, 8, 13, 26, 8, 32, 20, 8, 2, 10, 18, 8, 12, 26, 8, 104, 20, 8, 2, 10, 18, 8, 11, 26, 8, 97, 20, 8, 2, 10, 18, 8, 10, 26, 8, 115, 20, 8, 2, 10, 18, 8, 9, 26, 8, 32, 20, 8, 2, 10, 18, 8, 8, 26, 8, 121, 20, 8, 2, 10, 18, 8, 7, 26, 8, 105, 20, 8, 2, 10, 18, 8, 6, 26, 8, 101, 20, 8, 2, 10, 18, 8, 5, 26, 8, 108, 20, 8, 2, 10, 18, 8, 4, 26, 8, 100, 20, 8, 2, 10, 18, 8, 3, 26, 8, 101, 20, 8, 2, 10, 18, 8, 2, 26, 8, 100, 20, 8, 2, 10, 18, 8, 1, 26, 8, 33, 20, 8, 2, 18, 8, 15, 26, 8, 15, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 10, 18, 8, 2, 26, 34, 20, 8, 4, 36, 8, 8, 25, 8, 31650994541849710, 14, 4, 8, 1, 8, 2, 24, 8, 1, 10, 8, 0, 19, 8, 3, 26, 19, 8, 8, 19, 8, 1, 10, 8, 0, 19, 8, 3, 25, 34, 20, 8, 1, 10, 8, 0, 19, 8, 3, 26, 19, 8, 8, 8, 1, 10, 8, 0, 19, 8, 3, 25, 19, 25, 8, 1, 26, 19, 8, 1, 10, 8, 0, 19, 8, 4, 25, 34, 20, 8, 1, 10, 8, 0, 19, 8, 3, 26, 19, 8, 1, 10, 8, 0, 19, 8, 4, 25, 19, 19, 8, 1, 10, 8, 0, 19, 8, 5, 25, 34, 20, 8, 1, 5, 8, 0, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4, 94, 8, 1, 8, 2, 23, 8, 1, 10, 18, 8, 2, 26, 8, 1, 8, 0, 19, 20, 8, 1, 10, 18, 8, 1, 26, 34, 20, 8, 1, 8, 0, 8, 1, 18, 8, 2, 26, 20, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 8, 1, 10, 8, 0, 19, 8, 1, 26, 19, 18, 24, 8, 1, 10, 18, 8, 1, 26, 19, 8, 1, 10, 18, 8, 2, 26, 19, 8, 1, 10, 18, 8, 1, 8, 0, 19, 26, 24, 8, 1, 8, 0, 34, 20, 4]`
+
+    BIN = STARTBIN
+
+    function step() {
+        BIN = pyodide.runPython(pythonCode)
+        //console.log(BIN)
+    }
+
+    languagePluginLoader.then(() => {
+      return pyodide.loadPackage([])//'lark-parser==0.5.5'
+    }).then(() => {
+        setInterval(step, 1000/30)
+    })
+  </script>
+
+</head>
+
+<body></body>
+
+</html>
