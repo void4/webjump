@@ -2,17 +2,11 @@
 
 <head>
   <script type="text/javascript" src="pyodide.js"></script>
-  <div id="target">Change me!</div>
+  <div id="target">Loading...</div>
   <canvas id="canvas" />
   <script type="text/javascript">
     pythonCode = `
-
 from js import document
-
-e = document.getElementById("target")
-e.innerText = str("Finished")
-
-
 canvas = document.getElementById('canvas')
 
 context = canvas.getContext("2d")
@@ -685,6 +679,11 @@ flat = [int(i) for i in json.loads(BIN)]
 debug = False
 for i in range(1):
     flat = entry_point(flat, 100, 1000000, debug, None)
+
+
+
+e = document.getElementById("target")
+e.innerText = "Running..."
 
 draw(flat)
 json.dumps(flat)
